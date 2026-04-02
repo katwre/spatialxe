@@ -6,11 +6,19 @@ import numpy as np
 import pandas as pd
 import tifffile
 
+
 # Xenium full-resolution image: 1 pixel = 0.2125 µm (10x Genomics spec).
+# https://kb.10xgenomics.com/s/article/11636252598925-What-are-the-Xenium-image-scale-factors
 # Transcript x_location / y_location are in microns.
 # To overlay transcripts on the full-res image: pixel = micron / pixel_size.
 XENIUM_DEFAULT_PIXEL_SIZE_UM = 0.2125
 
+
+# Mock run:
+#nextflow run . -profile docker --input DATA/samplesheet.csv --method scs --mode image -c ./DATA/local.config --outdir results_scs_pipeline_test -ansi-log false
+#nextflow run . -profile docker --input DATA/samplesheet.csv --method scs --mode image -c ./DATA/test_scs_local.config --outdir results_scs_pipeline_test -ansi-log false -resume
+# nextflow run . -profile docker --input DATA/samplesheet.csv --method scs --mode image -c ./DATA/test_scs_local.config --outdir results_scs_pipeline_test -ansi-log false -resume
+# nextflow run . -profile docker --input DATA/samplesheet_full.csv --method scs --mode image -c ./DATA/local.config --outdir results_scs_pipeline_test -ansi-log false
 
 def _pick_column(df: pd.DataFrame,
                  candidates: list[str],
@@ -33,6 +41,52 @@ def _read_pixel_size(experiment_xenium_path: str) -> float:
         return XENIUM_DEFAULT_PIXEL_SIZE_UM
 
 
+def _build_density_grid(df: pd.DataFrame) -> np.ndarray:
+    """Builds a 2D density grid from the scs_input DataFrame."""
+    grid = np.zeros((df["row"].max() + 1, df["column"].max() + 1), dtype=np.float32)
+
+    for row, column, counts in df[["row", "column", "counts"]].itertuples(index=False):
+        grid[int(row), int(column)] += float(counts)
+
+    return grid
+def _plot_density_map(df, output_path) -> None:
+    """Plots a density map of all transcripts."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    density = _build_density_grid(df)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(np.log1p(density), cmap="magma", origin="lower")
+    ax.set_title("All transcripts density map (log1p counts)")
+    ax.set_xlabel("column")
+    ax.set_ylabel("row")
+    fig.colorbar(im, ax=ax, label="log1p(counts)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_hexbin_density(df, output_path) -> None:
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    x_col, y_col = "x_location", "y_location"
+    pts = df[[x_col, y_col]].dropna()
+
+    fig, ax = plt.subplots(figsize=(8,8))
+    hb = ax.hexbin(pts[x_col], pts[y_col], gridsize=200, bins="log", 
+                   mincnt=1, cmap="magma")
+    ax.set_title("Transcript molecule density (hexbin, log)")
+    ax.set_xlabel("x_location (µm)")
+    ax.set_ylabel("y_location (µm)")
+    ax.set_aspect("equal")
+    fig.colorbar(hb, ax=ax, label="log10(count)")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=250)
+    plt.close(fig)
+
+
 def convert_xenium_to_scs(parquet_path: str,
                           output_tsv: str,
                           output_bgi_tsv: str,
@@ -40,7 +94,7 @@ def convert_xenium_to_scs(parquet_path: str,
                           output_morph2d_tif: str,
                           metrics_tsv: str,
                           experiment_xenium_path: str = "",
-                          bin_size: float = 1.0):
+                          bin_size: float = 5.0):
     """
     Convert Xenium transcripts to SCS/BGI format with correct pixel-space coordinates.
 
@@ -49,9 +103,19 @@ def convert_xenium_to_scs(parquet_path: str,
     Coordinates are converted to pixels: pixel = micron / pixel_size.
     The morphology image is cropped to the pixel ROI covered by the transcripts.
     """
+
     pixel_size = _read_pixel_size(experiment_xenium_path) if experiment_xenium_path else XENIUM_DEFAULT_PIXEL_SIZE_UM
+    print(f"[xenium2scs] pixel_size_um: {pixel_size}")
 
     transcripts = pd.read_parquet(parquet_path, engine="pyarrow")
+    #print(transcripts.head())
+    #     transcript_id     cell_id  ...  codeword_category is_gene
+    #0  281474976711277  mpafcjmo-1  ...   predesigned_gene    True
+    #1  281474976711278  mpafcjmo-1  ...   predesigned_gene    True
+    #2  281474976711281  nljdpiah-1  ...   predesigned_gene    True
+    # ...
+    # transcripts rows=1985 cols=13
+    #print(f"[xenium2scs] transcripts rows={len(transcripts)} cols={len(transcripts.columns)}")
 
     gene_col = _pick_column(transcripts, ["feature_name", "gene", "gene_id", "geneID"])
     x_col    = _pick_column(transcripts, ["x_location", "x", "x_global_px", "x_centroid"])
@@ -60,6 +124,16 @@ def convert_xenium_to_scs(parquet_path: str,
 
     table = transcripts[[gene_col, x_col, y_col]].copy()
     table = table.dropna(subset=[gene_col, x_col, y_col])
+    #print(table.head())
+    #  feature_name  x_location  y_location
+    #0        Defa5  409.250000  301.453125
+    #1        Defa5  409.843750  304.281250
+    #2        Defa5  418.171875  316.671875
+    #3        Defa5  395.000000  290.468750
+    #4        Defa5  408.031250  303.218750
+
+    #plot_hexbin_density(table, 
+    #                    output_path="/home/katwre/projects/spatialxe_fork/spatialxe/DATA/table_pixel.png")
 
     # Convert micron coordinates → full-resolution pixel coordinates.
     # Xenium: x_location is along image width (columns), y_location along height (rows).
@@ -85,6 +159,9 @@ def convert_xenium_to_scs(parquet_path: str,
     table = table.rename(columns={gene_col: "geneID"})[["geneID", "row", "column", "counts"]]
     table = table.groupby(["geneID", "row", "column"], as_index=False)["counts"].sum()
 
+    #_plot_density_map(table,
+    #                 output_path="/home/katwre/projects/spatialxe_fork/spatialxe/DATA/table_spot.png")
+
     out_tsv = Path(output_tsv)
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(out_tsv, sep="\t", index=False)
@@ -100,6 +177,20 @@ def convert_xenium_to_scs(parquet_path: str,
         image2d = image.reshape((-1, h, w)).max(axis=0)
     else:
         raise ValueError(f"Unsupported morphology image shape: {image.shape}")
+
+    # contrast stretch for visibility
+    p1, p99 = np.percentile(image2d, [1, 99])
+    disp = np.clip(image2d, p1, p99)
+
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(8, 8))
+    plt.imshow(disp, cmap="gray")
+    plt.title(f"Morphology 2D (shape={image2d.shape})")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig("/home/katwre/projects/spatialxe_fork/spatialxe/DATA/morphology.png", 
+                dpi=250)
+    plt.close()
 
     # Crop to the pixel ROI covered by transcripts.
     # Derive absolute pixel bounds directly from physical coords in the parquet.
@@ -144,6 +235,7 @@ def convert_xenium_to_scs(parquet_path: str,
         "column_max":     int(table["column"].max()) if len(table) else 0,
         "pixel_size_um":  float(pixel_size),
         "bin_size":       float(bin_size),
+        "bin_size_um":    float(bin_size) * float(pixel_size),
         "morph2d_H":      int(cropped.shape[0]),
         "morph2d_W":      int(cropped.shape[1]),
     }
@@ -158,7 +250,7 @@ if __name__ == "__main__":
     morphology_image: str       = "${morphology_image}"
     experiment_xenium: str      = "${experiment_xenium}"
     prefix: str                 = "${prefix}"
-    bin_size: float             = float("${task.ext.bin_size ?: 1.0}")
+    bin_size: float             = float("${task.ext.bin_size ?: 5.0}")
 
     output_tsv        = f"{prefix}/scs_input.tsv"
     output_bgi_tsv    = f"{prefix}/scs_input_bgi.tsv"

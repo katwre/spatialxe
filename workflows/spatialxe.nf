@@ -30,6 +30,7 @@ include { CELLPOSE_RESOLIFT_MORPHOLOGY_OME_TIF             } from '../subworkflo
 include { CELLPOSE_BAYSOR_IMPORT_SEGMENTATION              } from '../subworkflows/local/cellpose_baysor_import_segmentation/main'
 include { XENIUMRANGER_RESEGMENT_MORPHOLOGY_OME_TIF        } from '../subworkflows/local/xeniumranger_resegment_morphology_ome_tif/main'
 include { SCS_PREPARE_MORPHOLOGY                            } from '../subworkflows/local/scs_prepare_morphology/main'
+include { SCS_SEGMENT                                      } from '../modules/local/scs/main'
 
 // segmentation-free subworkflows
 include { BAYSOR_GENERATE_SEGFREE                          } from '../subworkflows/local/baysor_generate_segfree/main'
@@ -384,13 +385,21 @@ workflow SPATIALXE {
         // prepare transcripts and morphology for SCS segmentation
         if (params.method == 'scs') {
 
+            log.warn("SCS mode currently runs Xenium->SCS conversion and SCS inference, but does not yet import SCS-derived masks/polygons back into xeniumranger import-segmentation in this branch.")
+
             SCS_PREPARE_MORPHOLOGY(
                 ch_morphology_image,
                 ch_transcripts_parquet,
                 ch_experiment_xenium,
             )
-            // TODO: Add SCS segment module here when ready
-            // For now, just preparing inputs
+            ch_versions = ch_versions.mix(SCS_PREPARE_MORPHOLOGY.out.versions)
+
+            ch_scs_segment_input = SCS_PREPARE_MORPHOLOGY.out.scs_input_bgi_tsv
+                .join(SCS_PREPARE_MORPHOLOGY.out.morphology_2d, by: 0)
+            // TEMP: Comment out SCS_SEGMENT to inspect SCS input files before running
+            // SCS_SEGMENT(ch_scs_segment_input)
+            // ch_versions = ch_versions.mix(SCS_SEGMENT.out.versions)
+
             ch_redefined_bundle = ch_bundle_path
             ch_coordinate_space = Channel.value("microns")
         }
